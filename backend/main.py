@@ -1,742 +1,1043 @@
-import os
-import re
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, Response
+import fitz  # PyMuPDF
+from pdf2image import convert_from_path
+import anthropic
+from anthropic import Anthropic, AsyncAnthropic
+import asyncio
 import json
 import uuid
-import asyncio
+import os
+from pathlib import Path
+from typing import List, Dict, Any
+from pydantic import BaseModel
+import base64
+import io
+from PIL import Image
+import tempfile
 import logging
-from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional
-from io import BytesIO
 
-import fitz  # PyMuPDF
-import anthropic
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from dotenv import load_dotenv
-
-from models import (
-    DetectionResult, 
-    RedactionConfig, 
-    DocumentAnalysis, 
-    AnalysisStatistics,
-    OPRACategory, 
-    OPRA_CATEGORIES
-)
-
-# Load environment variables
-load_dotenv()
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# Set up logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize Claude client
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-if not ANTHROPIC_API_KEY:
-    logger.error("ANTHROPIC_API_KEY not found in environment variables!")
-    raise ValueError("ANTHROPIC_API_KEY is required for AI detection")
+# Load environment variables
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # Load from .env file if it exists
+except ImportError:
+    pass  # dotenv not required in production
 
-claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-logger.info("Claude AI client initialized successfully")
+app = FastAPI(title="NJ OPRA Redaction Service")
 
-# FastAPI app
-app = FastAPI(
-    title="OpenRecord API",
-    description="AI-powered document redaction system for municipalities using Claude AI",
-    version="2.0.0"
-)
-
-# CORS middleware
+# CORS middleware for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:5173").split(","),
+    allow_origins=["http://localhost:3000"],  # React dev server
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# In-memory storage (use database in production)
-document_store = {}
-analysis_store = {}
+# Import the comprehensive detector
+from anthropic import Anthropic, AsyncAnthropic
 
-class AdvancedClaudeDetector:
-    """Claude AI-powered detection engine for OPRA compliance"""
+# Add after other imports
+import sys
+sys.path.append('.')  # Allow importing from current directory
+
+# We'll implement the comprehensive detector inline for now
+import re
+from dataclasses import dataclass
+from typing import List, Dict, Set, Tuple
+
+@dataclass
+class RedactionCandidate:
+    text: str
+    category: str
+    confidence: float
+    justification: str
+    start_pos: int = 0
+    end_pos: int = 0
+    detection_method: str = "AI"
+
+class ComprehensiveOPRADetector:
+    """Multi-layered OPRA exemption detection system"""
     
-    def __init__(self):
-        self.client = claude_client
-        self.model = "claude-3-sonnet-20240229"
-        
-        # Comprehensive regex patterns as backup/supplement to AI
+    def __init__(self, anthropic_client: AsyncAnthropic):
+        self.client = anthropic_client
+        self.setup_patterns()
+    
+    def setup_patterns(self):
+        """Define regex patterns for obvious PII"""
         self.patterns = {
             "ssn": {
-                "regex": r'\b\d{3}[-\s]?\d{2}[-\s]?\d{4}\b',
-                "category": OPRACategory.PERSONAL_IDENTIFYING,
+                "pattern": r'\b\d{3}-\d{2}-\d{4}\b',
+                "category": "REDACTED-N.J.S.A. 47:1A-1.1(20)",
                 "confidence": 0.95
             },
             "phone": {
-                "regex": r'\b(?:\+?1[-.\s]?)?\(?[2-9][0-9]{2}\)?[-.\s]?[0-9]{3}[-.\s]?[0-9]{4}\b',
-                "category": OPRACategory.PERSONAL_IDENTIFYING,
+                "pattern": r'\b(?:\(\d{3}\)|\d{3})[- ]?\d{3}[- ]?\d{4}\b',
+                "category": "REDACTED-N.J.S.A. 47:1A-1.1(20)",
                 "confidence": 0.85
             },
             "email": {
-                "regex": r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
-                "category": OPRACategory.PERSONAL_IDENTIFYING,
-                "confidence": 0.90
-            },
-            "credit_card": {
-                "regex": r'\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|3[0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})\b',
-                "category": OPRACategory.PERSONAL_IDENTIFYING,
-                "confidence": 0.98
-            },
-            "drivers_license": {
-                "regex": r'\b[A-Z]\d{13,14}\b',
-                "category": OPRACategory.PERSONAL_IDENTIFYING,
-                "confidence": 0.85
-            },
-            "address": {
-                "regex": r'\b\d+\s+[A-Za-z0-9\s,.-]+(?:street|st|avenue|ave|road|rd|drive|dr|lane|ln|boulevard|blvd|way|place|pl|court|ct)\b',
-                "category": OPRACategory.PERSONAL_IDENTIFYING,
-                "confidence": 0.75
-            },
-            "case_number": {
-                "regex": r'\b(?:case|docket|file|complaint)[\s#]*:?\s*[A-Z0-9\-]{4,20}\b',
-                "category": OPRACategory.CRIMINAL_INVESTIGATORY,
+                "pattern": r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
+                "category": "REDACTED-N.J.S.A. 47:1A-1.1(20)",
                 "confidence": 0.80
             },
-            "officer_badge": {
-                "regex": r'\b(?:officer|badge|patrol|detective)[\s#]*:?\s*[A-Z0-9]{2,8}\b',
-                "category": OPRACategory.CRIMINAL_INVESTIGATORY,
-                "confidence": 0.85
-            },
-            "medical_record": {
-                "regex": r'\b(?:MRN|MR|medical record)[\s#]*:?\s*[A-Z0-9]{6,12}\b',
-                "category": OPRACategory.HIPAA_DATA,
-                "confidence": 0.90
-            },
-            "date_of_birth": {
-                "regex": r'\b(?:DOB|date of birth|born)[\s:]*(?:0?[1-9]|1[0-2])[/\-](?:0?[1-9]|[12][0-9]|3[01])[/\-](?:19|20)?\d{2,4}\b',
-                "category": OPRACategory.PERSONAL_IDENTIFYING,
+            "credit_card": {
+                "pattern": r'\b(?:\d{4}[- ]?){3}\d{4}\b',
+                "category": "REDACTED-N.J.S.A. 47:1A-1.1(20)",
                 "confidence": 0.90
             }
         }
     
-    async def detect_with_claude(self, text: str, page_num: int, document_type: str) -> List[DetectionResult]:
-        """Use Claude AI for intelligent, context-aware detection"""
-        detections = []
+    async def detect_pattern_based(self, text: str) -> List[RedactionCandidate]:
+        """Pattern-based detection for obvious PII"""
+        candidates = []
         
-        if not text.strip():
-            return detections
+        for pattern_name, pattern_info in self.patterns.items():
+            matches = re.finditer(pattern_info["pattern"], text, re.IGNORECASE)
+            for match in matches:
+                candidates.append(RedactionCandidate(
+                    text=match.group(),
+                    category=pattern_info["category"],
+                    confidence=pattern_info["confidence"],
+                    justification=f"Pattern match: {pattern_name}",
+                    start_pos=match.start(),
+                    end_pos=match.end(),
+                    detection_method="pattern"
+                ))
         
-        # Build comprehensive prompt for Claude
-        prompt = self._build_claude_prompt(text, document_type)
+        logger.info(f"Pattern-based detection found {len(candidates)} candidates")
+        return candidates
+    
+    async def detect_ai_comprehensive(self, text: str) -> List[RedactionCandidate]:
+        """Comprehensive AI analysis with full OPRA schema"""
+        
+        prompt = f"""
+        You are a NJ OPRA compliance expert. Identify ALL information that must be redacted under New Jersey's Open Public Records Act.
+
+        MANDATORY REDACTION CATEGORIES:
+        
+        ### PERSONAL INFORMATION (High Priority)
+        - [REDACTED-N.J.S.A. 47:1A-1.1(20)]: SSNs, home addresses, phone numbers, birth dates, driver's licenses, credit cards, bank accounts, personal emails
+        - [REDACTED-N.J.S.A. 47:1A-1]: Personal info with reasonable expectation of privacy
+        - [REDACTED-N.J.S.A. 47:1A-1.1(23)]: Any information about persons under 18
+        
+        ### GOVERNMENT OPERATIONS
+        - [REDACTED-N.J.S.A. 47:1A-1.1(2)]: Internal memos, deliberative materials, draft documents, policy discussions
+        - [REDACTED-N.J.S.A. 47:1A-1.1(15)]: Harassment complaints, grievances, union negotiations
+        - [REDACTED-N.J.S.A. 47:1A-10]: Employee evaluations, disciplinary records, salary details
+        
+        ### LAW ENFORCEMENT & SECURITY  
+        - [REDACTED-N.J.S.A. 47:1A-1.1(5)]: Criminal investigation records, detective notes, surveillance
+        - [REDACTED-N.J.S.A. 47:1A-1.1(6)]: Victim records, domestic violence, sexual assault info
+        - [REDACTED-N.J.S.A. 47:1A-1.1(12)]: Security measures, undercover officers, patrol patterns
+        - [REDACTED-N.J.S.A. 47:1A-3(a)]: Ongoing investigations
+        
+        ### LEGAL & CONFIDENTIAL
+        - [REDACTED-N.J.S.A. 47:1A-1.1(9)]: Attorney-client privilege, legal advice, litigation strategy
+        - [REDACTED-N.J.S.A. 47:1A-1.1(17)]: Court-ordered confidential info, sealed records
+        
+        ### MEDICAL & HEALTH
+        - [REDACTED-N.J.S.A. 47:1A-1.1(28)]: HIPAA data, medical records, health insurance
+        
+        ### BUSINESS & TECHNICAL
+        - [REDACTED-N.J.S.A. 47:1A-1.1(8)]: Trade secrets, proprietary info, pricing strategies
+        - [REDACTED-N.J.S.A. 47:1A-1.1(10)]: Computer security, network diagrams, passwords
+        
+        TEXT TO ANALYZE:
+        {text}
+
+        SCAN FOR:
+        1. Direct matches (SSNs, phone numbers, addresses)
+        2. Context clues ("confidential", "internal", "privileged")
+        3. Implied redactions (employee names in disciplinary context)
+        4. Security-sensitive information
+        5. Any information about minors
+
+        Return JSON array ONLY - no other text:
+        [
+            {{
+                "text": "exact text to redact",
+                "category": "REDACTED-N.J.S.A. 47:1A-X.X(XX)",
+                "confidence": 0.95,
+                "justification": "specific reason"
+            }}
+        ]
+        """
         
         try:
-            response = await asyncio.to_thread(
-                self.client.messages.create,
-                model=self.model,
-                max_tokens=4000,
-                temperature=0.1,  # Low temperature for consistent results
+            response = await self.client.messages.create(
+                model="claude-3-5-sonnet-latest",
+                max_tokens=3000,
                 messages=[{"role": "user", "content": prompt}]
             )
             
-            # Parse Claude's response
-            ai_detections = self._parse_claude_response(response.content[0].text, text, page_num)
-            detections.extend(ai_detections)
+            response_text = response.content[0].text
+            logger.info(f"AI comprehensive response: {response_text[:200]}...")
             
-            logger.info(f"Claude AI detected {len(ai_detections)} items on page {page_num}")
+            candidates = []
+            try:
+                # Try direct JSON parse first
+                results = json.loads(response_text)
+                for result in results:
+                    candidates.append(RedactionCandidate(
+                        text=result["text"],
+                        category=result["category"],
+                        confidence=result["confidence"],
+                        justification=result["justification"],
+                        detection_method="AI"
+                    ))
+            except json.JSONDecodeError:
+                # Extract JSON from response if wrapped in text
+                json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
+                if json_match:
+                    try:
+                        results = json.loads(json_match.group(0))
+                        for result in results:
+                            candidates.append(RedactionCandidate(
+                                text=result["text"],
+                                category=result["category"],
+                                confidence=result["confidence"],
+                                justification=result["justification"],
+                                detection_method="AI"
+                            ))
+                    except:
+                        logger.error(f"Failed to parse extracted JSON: {json_match.group(0)[:200]}")
+            
+            logger.info(f"AI comprehensive detection found {len(candidates)} candidates")
+            return candidates
             
         except Exception as e:
-            logger.error(f"Claude AI detection failed: {e}")
-            # Continue with pattern detection as fallback
-        
-        return detections
+            logger.error(f"AI comprehensive detection failed: {e}")
+            return []
     
-    def detect_with_patterns(self, text: str, page_num: int) -> List[DetectionResult]:
-        """Pattern-based detection as backup/supplement"""
-        detections = []
+    def deduplicate_candidates(self, candidates: List[RedactionCandidate]) -> List[RedactionCandidate]:
+        """Remove duplicates, keeping highest confidence version"""
+        text_groups = {}
+        for candidate in candidates:
+            text_lower = candidate.text.lower().strip()
+            if text_lower not in text_groups:
+                text_groups[text_lower] = []
+            text_groups[text_lower].append(candidate)
         
-        for pattern_name, pattern_info in self.patterns.items():
-            try:
-                matches = re.finditer(pattern_info["regex"], text, re.IGNORECASE | re.MULTILINE)
-                for match in matches:
-                    # Get context around the match
-                    start_context = max(0, match.start() - 50)
-                    end_context = min(len(text), match.end() + 50)
-                    context = text[start_context:end_context]
-                    
-                    detection = DetectionResult(
-                        text=match.group().strip(),
-                        category=pattern_info["category"],
-                        confidence=pattern_info["confidence"],
-                        page_number=page_num,
-                        start_pos=match.start(),
-                        end_pos=match.end(),
-                        detection_reason=f"Pattern match: {pattern_name}",
-                        pattern_name=pattern_name,
-                        context=context
-                    )
-                    detections.append(detection)
-                    
-            except re.error as e:
-                logger.warning(f"Regex error for pattern {pattern_name}: {e}")
-                continue
+        deduplicated = []
+        for text, group in text_groups.items():
+            # Keep highest confidence candidate
+            best = max(group, key=lambda x: x.confidence)
+            deduplicated.append(best)
         
-        return detections
+        logger.info(f"Deduplicated {len(candidates)} → {len(deduplicated)} candidates")
+        return deduplicated
     
-    def _build_claude_prompt(self, text: str, document_type: str) -> str:
-        """Build comprehensive prompt for Claude AI"""
+    def validate_coverage(self, candidates: List[RedactionCandidate]) -> Dict[str, int]:
+        """Log coverage statistics"""
+        categories_found = {}
+        for candidate in candidates:
+            category = candidate.category
+            categories_found[category] = categories_found.get(category, 0) + 1
         
-        opra_categories_text = "\n".join([
-            f"**{category.value}**: {info['name']} - {info['description']}"
-            for category, info in OPRA_CATEGORIES.items()
-        ])
+        logger.info("OPRA Category Coverage:")
+        for category, count in sorted(categories_found.items()):
+            logger.info(f"  {category}: {count} items")
         
-        prompt = f"""You are an expert in New Jersey Open Public Records Act (OPRA) compliance, specifically trained to identify information that must be redacted from public documents according to NJ state law.
-
-DOCUMENT TYPE: {document_type}
-
-ACTIVE OPRA EXEMPTION CATEGORIES:
-{opra_categories_text}
-
-ANALYSIS INSTRUCTIONS:
-1. Carefully analyze the following document text
-2. Identify ANY information that falls under OPRA exemption categories
-3. Pay special attention to:
-   - Personal Identifying Information (SSNs, addresses, phone numbers, dates of birth, driver's license numbers)
-   - Names of individuals in sensitive contexts (defendants, victims, witnesses, minors)
-   - Medical information and HIPAA-protected data
-   - Criminal investigation details and case information
-   - Attorney-client privileged communications
-   - Any information that could compromise privacy or ongoing investigations
-
-4. For each detection, provide:
-   - The exact text to be redacted
-   - The specific OPRA category (use exact codes like "N.J.S.A. 47:1A-1.1(20)")
-   - Confidence level (0.0 to 1.0) - be conservative but thorough
-   - Brief reason for redaction
-   - Character position in text (estimate start and end positions)
-
-IMPORTANT GUIDELINES:
-- Be thorough but precise - identify all sensitive information
-- Consider context - names, numbers, and addresses in official documents likely need redaction
-- When in doubt about borderline cases, err on the side of protection
-- Focus on information that would violate privacy or compromise investigations
-
-RESPONSE FORMAT:
-Return your analysis as a JSON array with this exact structure:
-[
-  {{
-    "text": "exact text to redact",
-    "category": "N.J.S.A. 47:1A-1.1(20)",
-    "confidence": 0.95,
-    "reason": "Social Security Number - Personal Identifying Information",
-    "start_pos": 123,
-    "end_pos": 134
-  }}
-]
-
-DOCUMENT TEXT TO ANALYZE:
----
-{text}
----
-
-Please analyze this document and return ONLY the JSON array of redactions (no other text or formatting):"""
-
-        return prompt
+        return categories_found
     
-    def _parse_claude_response(self, response_text: str, original_text: str, page_num: int) -> List[DetectionResult]:
-        """Parse Claude's JSON response into DetectionResult objects"""
-        detections = []
+    async def analyze_comprehensive(self, text: str) -> List[RedactionCandidate]:
+        """Main analysis method"""
+        logger.info("Starting comprehensive OPRA analysis...")
+        
+        # Pass 1: Pattern-based detection
+        pattern_candidates = await self.detect_pattern_based(text)
+        
+        # Pass 2: Comprehensive AI analysis  
+        ai_candidates = await self.detect_ai_comprehensive(text)
+        
+        # Combine and deduplicate
+        all_candidates = pattern_candidates + ai_candidates
+        final_candidates = self.deduplicate_candidates(all_candidates)
+        
+        # Validate coverage
+        coverage = self.validate_coverage(final_candidates)
+        
+        logger.info(f"Comprehensive analysis complete: {len(final_candidates)} final redaction candidates")
+        
+        return final_candidates
+
+# Initialize Anthropic clients and comprehensive detector
+try:
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        logger.error("ANTHROPIC_API_KEY environment variable not found!")
+        client = None
+        async_client = None
+        comprehensive_detector = None
+    else:
+        client = Anthropic(api_key=api_key)  # For synchronous calls
+        async_client = AsyncAnthropic(api_key=api_key)  # For async calls
+        comprehensive_detector = ComprehensiveOPRADetector(async_client)
+        logger.info("✅ Anthropic clients and comprehensive detector initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize Anthropic client: {e}")
+    client = None
+    async_client = None
+    comprehensive_detector = None
+
+# Data models
+class RedactionItem(BaseModel):
+    page: int
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    category: str
+    text: str
+    confidence: float
+
+class DocumentAnalysis(BaseModel):
+    document_id: str
+    total_pages: int
+    redactions: List[RedactionItem]
+    status: str
+
+class RedactionUpdate(BaseModel):
+    redactions: List[RedactionItem]
+
+# Storage directories
+UPLOAD_DIR = Path("uploads")
+PROCESSED_DIR = Path("processed")
+UPLOAD_DIR.mkdir(exist_ok=True)
+PROCESSED_DIR.mkdir(exist_ok=True)
+
+# NJ OPRA redaction categories for AI prompt
+REDACTION_CATEGORIES = """
+### [REDACTED-N.J.S.A. 47:1A-1]: Privacy Interest
+- Citizen's personal information where disclosure would violate reasonable expectation of privacy
+- Examples: Birth dates, Social Security numbers, home addresses, personal phone numbers, medical history details, family member names in sensitive contexts
+
+### [REDACTED-N.J.S.A. 47:1A-1.1(20)]: Personal Identifying Information
+- Social Security numbers, home addresses, credit/debit card numbers, bank account information, birth dates, personal email addresses, telephone numbers, driver's license numbers
+- Examples: Employment applications with SSNs, credit card details, home addresses, license plates, drivers license numbers
+
+### [REDACTED-N.J.S.A. 47:1A-1.1(23)]: Juvenile Information
+- Personal identifying information of persons under 18, except for specific disclosures
+- Examples: School records with student identifiers, juvenile offender information, youth program participation lists
+
+### [REDACTED-N.J.S.A. 47:1A-1.1(9)]: Attorney-Client Privilege
+- Records within the attorney-client privilege
+- Examples: Legal advice memos, strategy discussions for litigation, settlement negotiations
+
+### [REDACTED-N.J.S.A. 47:1A-1.1(28)]: HIPAA Data
+- Data classified under HIPAA
+- Examples: Patient medical records, health insurance claims, treatment authorization, prescription information
+
+### [REDACTED-N.J.S.A. 47:1A-1.1(5)]: Criminal Investigatory Records
+- Records pertaining to criminal investigations
+- Examples: Detective notes, surveillance footage, confidential informant statements
+
+### [REDACTED-N.J.S.A. 47:1A-1.1(8)]: Trade Secrets
+- Trade secrets, proprietary commercial or financial information
+- Examples: Chemical formulas, manufacturing processes, customer lists, pricing strategies
+
+### [REDACTED-N.J.S.A. 47:1A-10]: Personnel and Pension Records
+- Personnel and pension records, except for specific disclosed information
+- Examples: Employee performance evaluations, salary details, disciplinary records
+"""
+
+async def analyze_text_with_ai(text: str) -> List[Dict]:
+    """Analyze text content for redaction candidates using Anthropic API"""
+    
+    prompt = f"""
+    You are an expert in New Jersey's Open Public Records Act (OPRA) redaction requirements. 
+    Analyze the following text and identify information that should be redacted according to NJ OPRA exemptions.
+
+    REDACTION CATEGORIES:
+    {REDACTION_CATEGORIES}
+
+    TEXT TO ANALYZE:
+    {text}
+
+    For each piece of information that should be redacted, provide:
+    1. The exact text that should be redacted
+    2. The specific NJ statute category (e.g., "REDACTED-N.J.S.A. 47:1A-1.1(20)")
+    3. A confidence score (0.0-1.0)
+    4. Brief justification
+
+    Return your response as a JSON array with this structure:
+    [
+        {{
+            "text": "exact text to redact",
+            "category": "REDACTED-N.J.S.A. 47:1A-1.1(20)",
+            "confidence": 0.95,
+            "justification": "Contains Social Security number"
+        }}
+    ]
+
+    Only identify information that clearly falls under NJ OPRA exemptions. Be conservative and precise.
+    """
+
+    try:
+        logger.info(f"Analyzing text of length: {len(text)}")
+        response = await client.messages.create(
+            model="claude-3-sonnet-20240229",  # Use Claude 3 instead of Claude 4
+            max_tokens=4000,
+            messages=[{
+                "role": "user",
+                "content": prompt
+            }]
+        )
+        
+        # Parse the JSON response
+        response_text = response.content[0].text
+        logger.info(f"AI response: {response_text[:500]}...")  # Log first 500 chars
+        
+        # Try to extract JSON from response
+        try:
+            result = json.loads(response_text)
+            logger.info(f"Successfully parsed {len(result)} redaction candidates")
+            return result
+        except json.JSONDecodeError:
+            logger.warning(f"Failed to parse as direct JSON, trying to extract from response")
+            # If not valid JSON, try to extract JSON from markdown code blocks
+            import re
+            json_match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', response_text, re.DOTALL)
+            if json_match:
+                result = json.loads(json_match.group(1))
+                logger.info(f"Extracted JSON from markdown, found {len(result)} redaction candidates")
+                return result
+            else:
+                logger.error(f"Could not parse AI response as JSON: {response_text}")
+                # Let's also try to find any JSON array in the response
+                json_array_match = re.search(r'\[.*?\]', response_text, re.DOTALL)
+                if json_array_match:
+                    try:
+                        result = json.loads(json_array_match.group(0))
+                        logger.info(f"Found JSON array in response, parsed {len(result)} redaction candidates")
+                        return result
+                    except:
+                        pass
+                return []
+        
+    except Exception as e:
+        logger.error(f"AI analysis error: {e}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        return []
+
+async def analyze_image_with_ai(image_data: bytes) -> List[Dict]:
+    """Analyze image content for redaction candidates using Anthropic API"""
+    
+    if not client:
+        logger.error("Anthropic client not initialized - check API key")
+        return []
+    
+    # Convert image to base64
+    image_base64 = base64.b64encode(image_data).decode()
+    
+    prompt = f"""
+    You are an expert in New Jersey's Open Public Records Act (OPRA) redaction requirements.
+    Analyze this image/PDF page and identify any text or information that should be redacted according to NJ OPRA exemptions.
+
+    REDACTION CATEGORIES:
+    {REDACTION_CATEGORIES}
+
+    For each piece of information that should be redacted, provide:
+    1. The exact text that should be redacted
+    2. The specific NJ statute category
+    3. A confidence score (0.0-1.0)
+    4. Approximate location description (e.g., "top-left", "middle-right")
+
+    Return your response as a JSON array with this structure:
+    [
+        {{
+            "text": "exact text to redact",
+            "category": "REDACTED-N.J.S.A. 47:1A-1.1(20)",
+            "confidence": 0.95,
+            "location": "top-left section"
+        }}
+    ]
+
+    Only identify information that clearly falls under NJ OPRA exemptions. Be conservative and precise.
+    """
+
+    try:
+        logger.info("Analyzing image with AI")
+        response = await client.messages.create(
+            model="claude-3-sonnet-20240229",  # Use Claude 3 instead of Claude 4
+            max_tokens=4000,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": prompt
+                    },
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": image_base64
+                        }
+                    }
+                ]
+            }]
+        )
+        
+        # Parse the JSON response
+        response_text = response.content[0].text
+        logger.info(f"AI image response: {response_text[:500]}...")
         
         try:
-            # Clean up response text
-            response_text = response_text.strip()
-            if response_text.startswith('```json'):
-                response_text = response_text[7:]
-            if response_text.endswith('```'):
-                response_text = response_text[:-3]
-            response_text = response_text.strip()
-            
-            # Handle case where Claude returns explanation before JSON
-            if not response_text.startswith('['):
-                # Try to find JSON array in the response
-                json_start = response_text.find('[')
-                json_end = response_text.rfind(']') + 1
-                if json_start != -1 and json_end != -1:
-                    response_text = response_text[json_start:json_end]
-            
-            # Parse JSON
-            claude_detections = json.loads(response_text)
-            
-            for detection_data in claude_detections:
-                try:
-                    text = detection_data.get("text", "").strip()
-                    category_str = detection_data.get("category", "")
-                    confidence = float(detection_data.get("confidence", 0.8))
-                    reason = detection_data.get("reason", "AI Detection")
-                    start_pos = int(detection_data.get("start_pos", 0))
-                    end_pos = int(detection_data.get("end_pos", len(text)))
-                    
-                    # Map category string to enum
-                    category = self._map_category_string(category_str)
-                    
-                    # Verify text exists in original and get accurate positions
-                    actual_text, actual_start, actual_end = self._find_text_in_original(
-                        text, original_text, start_pos, end_pos
-                    )
-                    
-                    if actual_text:
-                        # Get better context
-                        context_start = max(0, actual_start - 75)
-                        context_end = min(len(original_text), actual_end + 75)
-                        context = original_text[context_start:context_end]
-                        
-                        detection = DetectionResult(
-                            text=actual_text,
-                            category=category,
-                            confidence=min(confidence, 0.98),  # Cap confidence
-                            page_number=page_num,
-                            start_pos=actual_start,
-                            end_pos=actual_end,
-                            detection_reason=f"AI Detection: {reason}",
-                            pattern_name="claude_ai",
-                            context=context
-                        )
-                        detections.append(detection)
-                        
-                except (ValueError, KeyError, TypeError) as e:
-                    logger.warning(f"Invalid detection data from Claude: {e}")
-                    continue
-            
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse Claude response as JSON: {e}")
-            logger.debug(f"Raw response: {response_text}")
-        except Exception as e:
-            logger.error(f"Error processing Claude response: {e}")
-        
-        return detections
-    
-    def _map_category_string(self, category_str: str) -> OPRACategory:
-        """Map category string to OPRACategory enum"""
-        # Direct mapping
-        for category in OPRACategory:
-            if category.value == category_str:
-                return category
-        
-        # Fallback mappings
-        category_lower = category_str.lower()
-        if "personal" in category_lower or "identifying" in category_lower or "20" in category_str:
-            return OPRACategory.PERSONAL_IDENTIFYING
-        elif "criminal" in category_lower or "investigat" in category_lower or "5" in category_str:
-            return OPRACategory.CRIMINAL_INVESTIGATORY
-        elif "hipaa" in category_lower or "medical" in category_lower or "28" in category_str:
-            return OPRACategory.HIPAA_DATA
-        elif "attorney" in category_lower or "client" in category_lower or "9" in category_str:
-            return OPRACategory.ATTORNEY_CLIENT
-        elif "juvenile" in category_lower or "minor" in category_lower or "23" in category_str:
-            return OPRACategory.JUVENILE_INFO
-        
-        # Default fallback
-        return OPRACategory.PRIVACY_INTEREST
-    
-    def _find_text_in_original(self, target_text: str, original_text: str, 
-                              suggested_start: int, suggested_end: int) -> tuple:
-        """Find exact text match in original document"""
-        
-        # Try exact match first
-        exact_pos = original_text.find(target_text)
-        if exact_pos != -1:
-            return target_text, exact_pos, exact_pos + len(target_text)
-        
-        # Try case insensitive
-        exact_pos = original_text.lower().find(target_text.lower())
-        if exact_pos != -1:
-            actual_text = original_text[exact_pos:exact_pos + len(target_text)]
-            return actual_text, exact_pos, exact_pos + len(target_text)
-        
-        # Try around suggested position with some tolerance
-        search_start = max(0, suggested_start - 100)
-        search_end = min(len(original_text), suggested_end + 100)
-        search_area = original_text[search_start:search_end]
-        
-        # Look for partial matches
-        words = target_text.split()
-        if len(words) > 1:
-            # Try to find the first few words
-            for i in range(1, min(len(words) + 1, 4)):
-                partial = " ".join(words[:i])
-                pos = search_area.lower().find(partial.lower())
-                if pos != -1:
-                    actual_pos = search_start + pos
-                    actual_text = original_text[actual_pos:actual_pos + len(partial)]
-                    return actual_text, actual_pos, actual_pos + len(partial)
-        
-        return None, 0, 0
-
-# Initialize detector
-detector = AdvancedClaudeDetector()
-
-@app.get("/")
-async def root():
-    return {
-        "message": "OpenRecord API v2.0 with Claude AI",
-        "status": "running",
-        "ai_enabled": True
-    }
-
-@app.get("/health")
-async def health_check():
-    # Test Claude API connection
-    claude_status = "healthy"
-    try:
-        test_response = await asyncio.to_thread(
-            claude_client.messages.create,
-            model="claude-3-sonnet-20240229",
-            max_tokens=10,
-            messages=[{"role": "user", "content": "Test"}]
-        )
-        claude_status = "healthy"
+            result = json.loads(response_text)
+            logger.info(f"Successfully parsed {len(result)} image redaction candidates")
+            return result
+        except json.JSONDecodeError:
+            # Try to extract JSON from markdown code blocks
+            import re
+            json_match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', response_text, re.DOTALL)
+            if json_match:
+                result = json.loads(json_match.group(1))
+                logger.info(f"Extracted JSON from image analysis, found {len(result)} redaction candidates")
+                return result
+            else:
+                logger.error(f"Could not parse AI image response as JSON: {response_text}")
+                return []
+                
     except Exception as e:
-        logger.error(f"Claude health check failed: {e}")
-        claude_status = "unhealthy"
-    
-    return {
-        "status": "healthy",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "claude_ai": claude_status,
-        "detection_engines": {
-            "ai_detection": claude_status == "healthy",
-            "pattern_detection": True,
-            "context_analysis": True
-        }
-    }
+        logger.error(f"AI image analysis error: {e}")
+        return []
 
-@app.post("/documents/upload")
+def extract_text_coordinates(pdf_path: str, text: str, page_num: int) -> Dict:
+    """Find coordinates of specific text in PDF page"""
+    doc = fitz.open(pdf_path)
+    page = doc[page_num]
+    
+    # Search for the text
+    text_instances = page.search_for(text)
+    
+    if text_instances:
+        # Return the first instance coordinates
+        rect = text_instances[0]
+        return {
+            "x1": rect.x0,
+            "y1": rect.y0,
+            "x2": rect.x1,
+            "y2": rect.y1
+        }
+    else:
+        # If exact text not found, return approximate coordinates
+        # This is a fallback - in production you might want more sophisticated text matching
+        return {
+            "x1": 0,
+            "y1": 0,
+            "x2": 100,
+            "y2": 20
+        }
+
+@app.post("/upload")
 async def upload_document(file: UploadFile = File(...)):
+    """Upload and analyze a PDF document for redaction candidates"""
+    
     if not file.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
     
     # Generate unique document ID
     doc_id = str(uuid.uuid4())
+    logger.info(f"Processing document {doc_id}: {file.filename}")
     
-    # Read file content
-    content = await file.read()
+    # Save uploaded file
+    file_path = UPLOAD_DIR / f"{doc_id}.pdf"
+    with open(file_path, "wb") as buffer:
+        content = await file.read()
+        buffer.write(content)
     
-    try:
-        # Extract metadata using PyMuPDF
-        doc = fitz.open(stream=content, filetype="pdf")
-        metadata = {
-            "page_count": len(doc),
-            "title": doc.metadata.get("title", ""),
-            "author": doc.metadata.get("author", ""),
-            "creator": doc.metadata.get("creator", ""),
-            "creation_date": doc.metadata.get("creationDate", ""),
-        }
-        doc.close()
-        
-        # Store document
-        document_store[doc_id] = {
-            "id": doc_id,
-            "filename": file.filename,
-            "content": content,
-            "uploaded_at": datetime.now(timezone.utc).isoformat(),
-            "size": len(content),
-            "metadata": metadata
-        }
-        
-        logger.info(f"Document uploaded: {file.filename} ({len(content)} bytes, {metadata['page_count']} pages)")
-        
-        return {
-            "document_id": doc_id,
-            "filename": file.filename,
-            "size": len(content),
-            "metadata": metadata
-        }
-        
-    except Exception as e:
-        logger.error(f"Error processing uploaded document: {e}")
-        raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}")
-
-@app.post("/documents/{document_id}/analyze")
-async def analyze_document(document_id: str, config: RedactionConfig):
-    if document_id not in document_store:
-        raise HTTPException(status_code=404, detail="Document not found")
-    
-    document = document_store[document_id]
-    start_time = datetime.now()
-    
-    logger.info(f"Starting analysis of document {document_id} with config: {config.dict()}")
+    logger.info(f"Saved file to {file_path}, size: {len(content)} bytes")
     
     try:
-        # Process PDF
-        doc = fitz.open(stream=document["content"], filetype="pdf")
-        all_detections = []
+        # Open PDF and analyze
+        doc = fitz.open(file_path)
+        total_pages = len(doc)
+        all_redactions = []
         
-        # Process each page
-        for page_num in range(len(doc)):
-            page = doc.load_page(page_num)
-            text = page.get_text()
-            
-            if not text.strip():
-                continue
-            
-            page_detections = []
-            
-            # AI Detection with Claude (primary method)
-            if config.use_ai_detection:
-                try:
-                    ai_detections = await detector.detect_with_claude(
-                        text, page_num, config.document_type
-                    )
-                    page_detections.extend(ai_detections)
-                except Exception as e:
-                    logger.error(f"AI detection failed for page {page_num}: {e}")
-            
-            # Pattern Detection (backup/supplement)
-            if config.use_pattern_detection:
-                pattern_detections = detector.detect_with_patterns(text, page_num)
-                page_detections.extend(pattern_detections)
-            
-            # Filter by enabled categories
-            if config.enabled_categories:
-                page_detections = [
-                    d for d in page_detections 
-                    if d.category in config.enabled_categories
-                ]
-            
-            # Filter by confidence threshold
-            page_detections = [
-                d for d in page_detections 
-                if d.confidence >= config.confidence_threshold
-            ]
-            
-            all_detections.extend(page_detections)
-            logger.info(f"Page {page_num}: found {len(page_detections)} detections")
+        logger.info(f"PDF has {total_pages} pages")
         
-        doc.close()
-        
-        # Remove duplicates and overlaps
-        all_detections = remove_duplicate_detections(all_detections)
-        
-        # Calculate statistics
-        processing_time = (datetime.now() - start_time).total_seconds()
-        
-        categories_found = list(set([d.category for d in all_detections]))
-        pages_with_detections = list(set([d.page_number for d in all_detections]))
-        
-        # Confidence distribution
-        confidence_dist = {"low": 0, "medium": 0, "high": 0}
-        for d in all_detections:
-            if d.confidence < 0.6:
-                confidence_dist["low"] += 1
-            elif d.confidence < 0.8:
-                confidence_dist["medium"] += 1
+        for page_num in range(total_pages):
+            logger.info(f"Processing page {page_num + 1}/{total_pages}")
+            page = doc[page_num]
+            
+            # Extract text from page
+            page_text = page.get_text()
+            logger.info(f"Page {page_num + 1} text length: {len(page_text)}")
+            
+            # Convert page to image for AI analysis
+            pix = page.get_pixmap()
+            img_data = pix.tobytes("png")
+            logger.info(f"Generated page image, size: {len(img_data)} bytes")
+            
+            # Analyze text content with comprehensive OPRA detection
+            if page_text.strip():
+                logger.info(f"Analyzing text content for page {page_num + 1} with comprehensive OPRA detection")
+                text_redactions = await analyze_text_with_ai(page_text)
+                logger.info(f"Comprehensive analysis found {len(text_redactions)} text-based redaction candidates")
+                
+                for redaction in text_redactions:
+                    # Find coordinates for this text
+                    coords = extract_text_coordinates(str(file_path), redaction["text"], page_num)
+                    
+                    all_redactions.append(RedactionItem(
+                        page=page_num,
+                        x1=coords["x1"],
+                        y1=coords["y1"],
+                        x2=coords["x2"],
+                        y2=coords["y2"],
+                        category=redaction["category"],
+                        text=redaction["text"],
+                        confidence=redaction["confidence"]
+                    ))
             else:
-                confidence_dist["high"] += 1
+                logger.info(f"Page {page_num + 1} has no extractable text")
+            
+            # Analyze image content with comprehensive OPRA detection
+            logger.info(f"Analyzing image content for page {page_num + 1}")
+            image_redactions = await analyze_image_with_ai(img_data)
+            logger.info(f"Image analysis found {len(image_redactions)} image-based redaction candidates")
+            
+            for redaction in image_redactions:
+                # For image-based redactions, estimate coordinates based on document structure
+                # In production, you might use more sophisticated OCR coordinate detection
+                all_redactions.append(RedactionItem(
+                    page=page_num,
+                    x1=50,  # Better placeholder coordinates
+                    y1=50 + (len(all_redactions) * 25),  # Stagger vertically
+                    x2=250,
+                    y2=70 + (len(all_redactions) * 25),
+                    category=redaction["category"],
+                    text=redaction["text"],
+                    confidence=redaction["confidence"]
+                ))
         
-        statistics = AnalysisStatistics(
-            total_detections=len(all_detections),
-            high_confidence_count=len([d for d in all_detections if d.confidence > 0.8]),
-            categories_found=categories_found,
-            pages_with_detections=pages_with_detections,
-            processing_time=processing_time
+        doc.close()
+        
+        logger.info(f"Total redaction candidates found: {len(all_redactions)}")
+        
+        # Store analysis results
+        analysis = DocumentAnalysis(
+            document_id=doc_id,
+            total_pages=total_pages,
+            redactions=all_redactions,
+            status="analyzed"
         )
         
-        # Create analysis record
-        analysis_id = str(uuid.uuid4())
-        analysis = {
-            "id": analysis_id,
-            "document_id": document_id,
-            "total_detections": len(all_detections),
-            "high_confidence_count": statistics.high_confidence_count,
-            "categories": [cat.value for cat in categories_found],
-            "detections": [d.dict() for d in all_detections],
-            "statistics": statistics.dict(),
-            "processing_time": processing_time,
-            "config_used": config.dict(),
-            "created_at": datetime.now(timezone.utc).isoformat()
-        }
+        # Save analysis to file (in production, use a database)
+        analysis_path = PROCESSED_DIR / f"{doc_id}_analysis.json"
+        with open(analysis_path, "w") as f:
+            json.dump(analysis.dict(), f, indent=2)
         
-        analysis_store[analysis_id] = analysis
-        
-        logger.info(f"Analysis completed: {len(all_detections)} detections in {processing_time:.2f}s")
-        
+        logger.info(f"Analysis complete for document {doc_id}")
         return analysis
         
     except Exception as e:
-        logger.error(f"Error analyzing document {document_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Error analyzing document: {str(e)}")
+        logger.error(f"Analysis failed for document {doc_id}: {str(e)}")
+        # Clean up on error
+        if file_path.exists():
+            file_path.unlink()
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
-@app.post("/documents/{document_id}/redact")
-async def apply_redactions(document_id: str, redactions: List[Dict[str, Any]]):
-    if document_id not in document_store:
+@app.get("/document/{doc_id}")
+async def get_document_analysis(doc_id: str):
+    """Get analysis results for a document"""
+    
+    analysis_path = PROCESSED_DIR / f"{doc_id}_analysis.json"
+    
+    if not analysis_path.exists():
         raise HTTPException(status_code=404, detail="Document not found")
     
-    document = document_store[document_id]
-    approved_redactions = [r for r in redactions if r.get("approved", True)]
+    with open(analysis_path, "r") as f:
+        analysis_data = json.load(f)
     
-    if not approved_redactions:
-        raise HTTPException(status_code=400, detail="No approved redactions to apply")
+    return DocumentAnalysis(**analysis_data)
+
+@app.put("/document/{doc_id}/redactions")
+async def update_redactions(doc_id: str, updates: RedactionUpdate):
+    """Update redaction selections after user review"""
     
-    logger.info(f"Applying {len(approved_redactions)} redactions to document {document_id}")
+    analysis_path = PROCESSED_DIR / f"{doc_id}_analysis.json"
+    
+    if not analysis_path.exists():
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    # Load existing analysis
+    with open(analysis_path, "r") as f:
+        analysis_data = json.load(f)
+    
+    # Update redactions
+    analysis_data["redactions"] = [r.dict() for r in updates.redactions]
+    analysis_data["status"] = "reviewed"
+    
+    # Save updated analysis
+    with open(analysis_path, "w") as f:
+        json.dump(analysis_data, f)
+    
+    return {"status": "updated"}
+
+@app.post("/document/{doc_id}/redact")
+async def generate_redacted_pdf(doc_id: str):
+    """Generate final redacted PDF"""
+    
+    # Load analysis
+    analysis_path = PROCESSED_DIR / f"{doc_id}_analysis.json"
+    original_path = UPLOAD_DIR / f"{doc_id}.pdf"
+    
+    if not analysis_path.exists() or not original_path.exists():
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    with open(analysis_path, "r") as f:
+        analysis_data = json.load(f)
     
     try:
-        # Apply redactions using PyMuPDF
-        doc = fitz.open(stream=document["content"], filetype="pdf")
+        # Open original PDF
+        doc = fitz.open(original_path)
         
-        # Group redactions by page
-        redactions_by_page = {}
-        for redaction in approved_redactions:
-            page_num = redaction["page_number"]
-            if page_num not in redactions_by_page:
-                redactions_by_page[page_num] = []
-            redactions_by_page[page_num].append(redaction)
+        # Apply redactions
+        for redaction in analysis_data["redactions"]:
+            page = doc[redaction["page"]]
+            
+            # Create redaction rectangle
+            rect = fitz.Rect(
+                redaction["x1"],
+                redaction["y1"],
+                redaction["x2"],
+                redaction["y2"]
+            )
+            
+            # Add redaction annotation
+            annot = page.add_redact_annot(rect)
+            annot.set_info(content=f"[{redaction['category']}]")
+            annot.update()
         
-        # Apply redactions page by page
-        for page_num, page_redactions in redactions_by_page.items():
-            if page_num >= len(doc):
-                continue
-            
-            page = doc.load_page(page_num)
-            
-            for redaction in page_redactions:
-                # Find text instances on page
-                text_instances = page.search_for(redaction["text"])
-                
-                if not text_instances:
-                    # Try case-insensitive search
-                    all_text = page.get_text()
-                    text_lower = redaction["text"].lower()
-                    idx = all_text.lower().find(text_lower)
-                    if idx != -1:
-                        # Create approximate rectangle
-                        # This is a simplified approach - in production you'd want more precise positioning
-                        rect = fitz.Rect(50, 50 + idx * 0.1, 200, 70 + idx * 0.1)
-                        text_instances = [rect]
-                
-                for rect in text_instances:
-                    # Create redaction annotation
-                    redact_annot = page.add_redact_annot(rect)
-                    category = redaction.get("category", "REDACTED")
-                    redact_annot.set_info(content=f"[REDACTED-{category}]")
-                    redact_annot.update()
-            
-            # Apply all redactions on this page
-            page.apply_redactions()
+        # Apply all redactions
+        for page_num in range(len(doc)):
+            doc[page_num].apply_redactions()
         
         # Save redacted PDF
-        pdf_bytes = doc.tobytes()
+        redacted_path = PROCESSED_DIR / f"{doc_id}_redacted.pdf"
+        doc.save(redacted_path)
         doc.close()
         
-        logger.info(f"Successfully applied redactions to document {document_id}")
-        
-        return StreamingResponse(
-            BytesIO(pdf_bytes),
-            media_type="application/pdf",
-            headers={"Content-Disposition": f"attachment; filename=redacted_{document['filename']}"}
-        )
+        return {"status": "redacted", "download_url": f"/download/{doc_id}"}
         
     except Exception as e:
-        logger.error(f"Error applying redactions: {e}")
-        raise HTTPException(status_code=500, detail=f"Error applying redactions: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Redaction failed: {str(e)}")
 
-@app.get("/documents")
-async def list_documents():
-    documents = []
-    for doc_id, doc_data in document_store.items():
-        documents.append({
-            "id": doc_id,
-            "filename": doc_data["filename"],
-            "uploaded_at": doc_data["uploaded_at"],
-            "size": doc_data["size"],
-            "page_count": doc_data["metadata"]["page_count"]
-        })
-    return {"documents": documents}
+@app.get("/download/{doc_id}")
+async def download_redacted_pdf(doc_id: str):
+    """Download the redacted PDF"""
+    
+    redacted_path = PROCESSED_DIR / f"{doc_id}_redacted.pdf"
+    
+    if not redacted_path.exists():
+        raise HTTPException(status_code=404, detail="Redacted document not found")
+    
+    return FileResponse(
+        redacted_path,
+        media_type="application/pdf",
+        filename=f"redacted_{doc_id}.pdf"
+    )
 
-@app.get("/config/patterns")
-async def get_available_patterns():
-    return {
-        "patterns": {
-            name: {
-                "description": name.replace("_", " ").title(),
-                "category": info["category"].value,
-                "confidence": info["confidence"]
-            }
-            for name, info in detector.patterns.items()
-        },
-        "categories": {
-            category.value: {
-                "name": info["name"],
-                "description": info["description"],
-                "examples": info["examples"]
-            }
-            for category, info in OPRA_CATEGORIES.items()
-        },
-        "document_types": [
-            "general", "police_report", "court_document", 
-            "personnel_record", "medical_record", "legal_document"
-        ]
-    }
-
-@app.delete("/documents/{document_id}")
-async def delete_document(document_id: str):
-    if document_id not in document_store:
+@app.get("/document/{doc_id}/page/{page_num}")
+async def get_page_image(doc_id: str, page_num: int):
+    """Get a page as an image for frontend preview"""
+    
+    pdf_path = UPLOAD_DIR / f"{doc_id}.pdf"
+    
+    if not pdf_path.exists():
+        logger.error(f"Document not found: {pdf_path}")
         raise HTTPException(status_code=404, detail="Document not found")
     
-    # Remove document
-    del document_store[document_id]
-    
-    # Remove associated analyses
-    analysis_ids_to_remove = [
-        aid for aid, analysis in analysis_store.items()
-        if analysis.get("document_id") == document_id
-    ]
-    
-    for aid in analysis_ids_to_remove:
-        del analysis_store[aid]
-    
-    logger.info(f"Deleted document {document_id} and {len(analysis_ids_to_remove)} associated analyses")
-    
-    return {"message": f"Document {document_id} deleted successfully"}
+    try:
+        logger.info(f"Generating page image for doc {doc_id}, page {page_num}")
+        doc = fitz.open(pdf_path)
+        
+        if page_num >= len(doc) or page_num < 0:
+            doc.close()
+            raise HTTPException(status_code=400, detail="Invalid page number")
+            
+        page = doc[page_num]
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x zoom for better quality
+        img_data = pix.tobytes("png")
+        doc.close()
+        
+        logger.info(f"Generated page image, size: {len(img_data)} bytes")
+        
+        return Response(content=img_data, media_type="image/png")
+        
+    except Exception as e:
+        logger.error(f"Failed to generate page image: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate page image: {str(e)}")
 
-def remove_duplicate_detections(detections: List[DetectionResult]) -> List[DetectionResult]:
-    """Remove duplicate and overlapping detections"""
-    if not detections:
-        return detections
+@app.get("/test")
+async def test_endpoint():
+    """Test endpoint to verify API is working"""
+    return {
+        "status": "API is working", 
+        "anthropic_key_configured": bool(os.getenv("ANTHROPIC_API_KEY")),
+        "clients_initialized": bool(async_client and client),
+        "comprehensive_detector_ready": bool(comprehensive_detector)
+    }
+
+@app.post("/test-ai-comprehensive")
+async def test_comprehensive_opra():
+    """Test the comprehensive OPRA detection system"""
+    # More complex sample text with multiple OPRA exemptions
+    sample_text = """
+    INTERNAL MEMO - CONFIDENTIAL
     
-    # Sort by page and position
-    detections.sort(key=lambda x: (x.page_number, x.start_pos))
+    Employee John Doe (SSN: 123-45-6789) was disciplined for policy violation.
+    Home address: 456 Oak Street, Newark, NJ 07101
+    Phone: (973) 555-0123
+    Email: john.doe@gmail.com
     
-    deduplicated = []
+    This matter is subject to attorney-client privilege as legal counsel advised on disciplinary procedures.
     
-    for current in detections:
-        overlaps = False
+    Victim Sarah Johnson reported the incident (case #2024-001).
+    Detective notes indicate ongoing investigation - surveillance footage shows suspect at location.
+    
+    Medical records from Dr. Smith's office show employee was treated for work-related injury.
+    Insurance claim #789456 processed for $15,000.
+    
+    Security camera access code: 4821
+    Network password: SecurePass123
+    
+    Minor involved: Student ID #12345 (age 16) witnessed incident.
+    """
+    
+    try:
+        if not comprehensive_detector:
+            return {"error": "Comprehensive detector not initialized", "success": False}
         
-        for i, existing in enumerate(deduplicated):
-            if (current.page_number == existing.page_number and
-                current.start_pos < existing.end_pos and
-                current.end_pos > existing.start_pos):
-                
-                # Keep the one with higher confidence
-                if current.confidence > existing.confidence:
-                    deduplicated[i] = current
-                overlaps = True
-                break
+        logger.info("Starting comprehensive OPRA test...")
+        candidates = await comprehensive_detector.analyze_comprehensive(sample_text)
         
-        if not overlaps:
-            deduplicated.append(current)
+        # Convert to simple format for response
+        results = []
+        for candidate in candidates:
+            results.append({
+                "text": candidate.text,
+                "category": candidate.category,
+                "confidence": candidate.confidence,
+                "justification": candidate.justification,
+                "method": candidate.detection_method
+            })
+        
+        # Count by category
+        categories = {}
+        for result in results:
+            cat = result["category"]
+            categories[cat] = categories.get(cat, 0) + 1
+        
+        return {
+            "success": True,
+            "sample_text": sample_text,
+            "redactions_found": len(results),
+            "redactions": results,
+            "categories_detected": categories,
+            "coverage_analysis": f"Found {len(categories)} different OPRA categories"
+        }
+        
+    except Exception as e:
+        logger.error(f"Comprehensive OPRA test failed: {e}")
+        return {"error": str(e), "success": False}
+
+@app.post("/test-ai")
+async def test_ai_analysis():
+    """Test AI analysis with sample text - now using comprehensive system"""
+    sample_text = "John Doe lives at 123 Main Street, Anytown, NJ 07001. His Social Security number is 123-45-6789. Phone: (555) 123-4567."
     
-    return deduplicated
+    try:
+        logger.info("Starting test AI analysis with comprehensive system...")
+        logger.info(f"Sample text: {sample_text}")
+        
+        result = await analyze_text_with_ai(sample_text)
+        
+        logger.info(f"Test AI analysis complete, found {len(result)} redactions")
+        for i, redaction in enumerate(result):
+            logger.info(f"  Redaction {i+1}: {redaction}")
+        
+        return {"sample_text": sample_text, "redactions_found": len(result), "redactions": result}
+    except Exception as e:
+        logger.error(f"Test AI analysis failed: {e}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        return {"error": str(e), "sample_text": sample_text, "redactions_found": 0, "redactions": []}
+
+@app.post("/debug-ai-chain")
+async def debug_ai_chain():
+    """Debug the AI analysis chain step by step"""
+    sample_text = "John has SSN 123-45-6789 and lives at 456 Oak St."
+    
+    try:
+        logger.info("=== DEBUG AI CHAIN ===")
+        
+        # Step 1: Check detector
+        if not comprehensive_detector:
+            return {"error": "Comprehensive detector not initialized", "step": "detector_check"}
+        logger.info("✓ Comprehensive detector initialized")
+        
+        # Step 2: Test pattern detection
+        pattern_candidates = await comprehensive_detector.detect_pattern_based(sample_text)
+        logger.info(f"✓ Pattern detection found {len(pattern_candidates)} candidates")
+        
+        # Step 3: Test AI detection  
+        ai_candidates = await comprehensive_detector.detect_ai_comprehensive(sample_text)
+        logger.info(f"✓ AI detection found {len(ai_candidates)} candidates")
+        
+        # Step 4: Test full analysis
+        full_result = await comprehensive_detector.analyze_comprehensive(sample_text)
+        logger.info(f"✓ Full analysis found {len(full_result)} candidates")
+        
+        # Step 5: Test wrapper function
+        wrapper_result = await analyze_text_with_ai(sample_text)
+        logger.info(f"✓ Wrapper function found {len(wrapper_result)} candidates")
+        
+        return {
+            "success": True,
+            "sample_text": sample_text,
+            "pattern_count": len(pattern_candidates),
+            "ai_count": len(ai_candidates), 
+            "full_count": len(full_result),
+            "wrapper_count": len(wrapper_result),
+            "wrapper_result": wrapper_result
+        }
+        
+    except Exception as e:
+        logger.error(f"Debug chain failed: {e}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        return {"error": str(e), "success": False}
+
+@app.post("/test-ai-direct")
+async def test_ai_direct():
+    """Test direct AI call to debug API issues"""
+    try:
+        if not async_client:
+            return {"error": "Anthropic async client not initialized - check API key", "success": False}
+            
+        logger.info("Testing direct AI call...")
+        response = await async_client.messages.create(
+            model="claude-3-5-sonnet-latest",
+            max_tokens=1000,
+            messages=[{
+                "role": "user",
+                "content": "Find any Social Security numbers in this text: John's SSN is 123-45-6789. Return only JSON array like: [{\"text\": \"123-45-6789\", \"type\": \"SSN\"}]"
+            }]
+        )
+        
+        # FIXED: Access response.content[0].text
+        response_text = response.content[0].text
+        logger.info(f"Direct AI response: {response_text}")
+        
+        return {
+            "raw_response": response_text,
+            "success": True
+        }
+    except Exception as e:
+        logger.error(f"Direct AI test failed: {e}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        return {"error": str(e), "success": False}
+
+@app.post("/debug-pdf-text")
+async def debug_pdf_text(file: UploadFile = File(...)):
+    """Debug PDF text extraction and analysis"""
+    
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+    
+    doc_id = str(uuid.uuid4())[:8]  # Short ID for debugging
+    
+    try:
+        # Save file temporarily
+        file_path = UPLOAD_DIR / f"debug_{doc_id}.pdf"
+        with open(file_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+        
+        logger.info(f"Debug: Saved PDF to {file_path}, size: {len(content)} bytes")
+        
+        # Extract text
+        doc = fitz.open(file_path)
+        page = doc[0]  # Just test first page
+        page_text = page.get_text()
+        doc.close()
+        
+        logger.info(f"Debug: Extracted text length: {len(page_text)}")
+        logger.info(f"Debug: First 200 chars: {page_text[:200]}")
+        
+        if not page_text.strip():
+            return {
+                "error": "No text extracted from PDF",
+                "text_length": len(page_text),
+                "file_size": len(content)
+            }
+        
+        # Test analysis
+        redactions = await analyze_text_with_ai(page_text)
+        
+        # Cleanup
+        file_path.unlink()
+        
+        return {
+            "success": True,
+            "text_length": len(page_text),
+            "text_preview": page_text[:500],
+            "redactions_found": len(redactions),
+            "redactions": redactions
+        }
+        
+    except Exception as e:
+        logger.error(f"Debug PDF failed: {e}")
+        return {"error": str(e), "success": False}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        app, 
-        host=os.getenv("HOST", "0.0.0.0"), 
-        port=int(os.getenv("PORT", 8000)),
-        log_level="info"
+    
+    # Set up logging to work with the startup script
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler()  # This will go to the startup.log via nohup
+        ]
     )
+    
+    logger.info("=" * 50)
+    logger.info("NJ OPRA Redaction Service - Backend Starting")
+    logger.info("=" * 50)
+    
+    # Check environment
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        logger.error("⚠️  ANTHROPIC_API_KEY not found in environment!")
+        logger.error("   Create backend/.env file with: ANTHROPIC_API_KEY=your_key_here")
+        logger.error("   Or export ANTHROPIC_API_KEY=your_key_here")
+    else:
+        logger.info("✅ ANTHROPIC_API_KEY configured")
+    
+    # Check directories
+    UPLOAD_DIR.mkdir(exist_ok=True)
+    PROCESSED_DIR.mkdir(exist_ok=True)
+    logger.info("✅ Upload and processed directories ready")
+    
+    logger.info("🚀 Starting server on http://localhost:8000")
+    logger.info("📚 API docs available at http://localhost:8000/docs")
+    logger.info("🧪 Test endpoints: /test and /test-ai")
+    
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    except Exception as e:
+        logger.error(f"❌ Failed to start server: {e}")
